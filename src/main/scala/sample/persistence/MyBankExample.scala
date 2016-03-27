@@ -1,35 +1,36 @@
 package sample.persistence
 
-import akka.actor.{ActorPath, ActorSystem, Props}
+import akka.actor.{ActorPath, ActorSystem, Props, Stash}
 import akka.persistence._
 
 /**
   * Created by greghuang on 3/26/16.
   **/
-sealed trait Transaction
+sealed trait AccountOp
 
-case class Withdraw(money: Int) extends Transaction
+case class Withdraw(money: Int) extends AccountOp
 
-case class Deposit(money: Int) extends Transaction
+case class Deposit(money: Int) extends AccountOp
 
-case class Transfer(money: Int, destination: ActorPath) extends Transaction
+case object Transaction extends AccountOp
 
-case object Query extends Transaction
+case object Query extends AccountOp
 
-case object Snapshot extends Transaction
+sealed trait TransactionOp
 
-case class DeliveryCmd(deliveryId: Long, money: Int)
+case class TransferCmd(money: Int, destination: ActorPath) extends TransactionOp
 
-case class ConfirmedCmd(deliveryId: Long)
+case class DeliveryCmd(deliveryId: Long, money: Int) extends TransactionOp
+
+case class ConfirmedCmd(deliveryId: Long) extends TransactionOp
 
 case class AmountEvt(amount: Int)
 
-sealed trait TransactionEvt
-
+sealed abstract class TransactionEvt
 case class MoneySentEvt(money: Int, destination: ActorPath) extends TransactionEvt
-
 case class MoneyConfrimedEvt(deliveryId: Long) extends TransactionEvt
 
+case object Snapshot
 
 case class Balance(account: String) {
   val accountName = account
@@ -46,7 +47,9 @@ object BankAccountActor {
   def props(name: String): Props = Props(new BankAccountActor(name))
 }
 
-class BankAccountActor(name: String) extends PersistentActor with AtLeastOnceDelivery {
+class BankAccountActor(name: String) extends PersistentActor with AtLeastOnceDelivery with Stash {
+
+  import context._
   override def persistenceId: String = s"$name-account-1"
 
   val accountName = name
@@ -69,7 +72,7 @@ class BankAccountActor(name: String) extends PersistentActor with AtLeastOnceDel
       lastSnapshot = metadata
       myBalance = offeredSnapshot
     }
-    case RecoveryCompleted => println(s"$accountName account recovery is done!")
+    case RecoveryCompleted => println(s"Recovery is done, $accountName has ${myBalance.deposits}!")
   }
 
   override def saveSnapshot(snapshot: Any): Unit = {
@@ -87,17 +90,6 @@ class BankAccountActor(name: String) extends PersistentActor with AtLeastOnceDel
     deleteMessages(lastSequenceNr)
   }
 
-  //  def Transaction: Receive = {
-  //    case Transfer(money, destination) => {
-  //      persist(AmountEvt(-money))(myBalance.update)
-  //      persist(MoneySentEvt(money, destination))(transfer)
-  //    }
-  //    case ConfirmedCmd(deliveryId) => {
-  //      persist(MoneyConfrimedEvt(deliveryId))(transfer)
-  //    }
-  //    case _ => stash()
-  //  }
-
   def transfer(evt: TransactionEvt): Unit = evt match {
     case MoneySentEvt(money, destination) =>
       deliver(destination)(deliveryId => DeliveryCmd(deliveryId, money))
@@ -107,25 +99,37 @@ class BankAccountActor(name: String) extends PersistentActor with AtLeastOnceDel
 
   def checkDeposits(money: Int): Boolean = money <= myBalance.deposits && money > 0
 
-  override def receiveCommand: Receive = {
-    case Withdraw(money) if checkDeposits(money) => persist(AmountEvt(-money))(myBalance.update)
-    case Deposit(money) if money > 0 => persist(AmountEvt(money))(myBalance.update)
-    case Transfer(money, destination) if checkDeposits(money) => {
+  def doTransaction: Receive = {
+    case TransferCmd(money, destination) if checkDeposits(money) => {
+      println(s"Transfer money...($accountName)")
       persist(AmountEvt(-money))(myBalance.update)
       persist(MoneySentEvt(money, destination))(transfer)
     }
+    case ConfirmedCmd(deliveryId) => {
+      println(s"Confirmed...($accountName)")
+      persist(MoneyConfrimedEvt(deliveryId))(transfer)
+      unstashAll()
+      unbecome()
+    }
     case DeliveryCmd(deliveryId, money) if money > 0 => {
+      println(s"Receive money...($accountName)")
       persist(AmountEvt(money))(myBalance.update)
       sender() ! ConfirmedCmd(deliveryId)
+      unstashAll()
+      unbecome()
     }
-    case ConfirmedCmd(deliveryId) => {
-      persist(MoneyConfrimedEvt(deliveryId))(transfer)
-    }
+    case _ => stash()
+  }
+
+  override def receiveCommand: Receive = {
+    case Withdraw(money) if checkDeposits(money) => persist(AmountEvt(-money))(myBalance.update)
+    case Deposit(money) if money > 0 => persist(AmountEvt(money))(myBalance.update)
+    case Transaction => become(doTransaction)
     case Query => println(myBalance.toString)
     case Snapshot => saveSnapshot(myBalance)
     case SaveSnapshotSuccess(metadata) => println("Save snapshot successfully in " + metadata)
     case SaveSnapshotFailure(metadata, reason) => println(reason)
-    case _ => sender ! akka.actor.Status.Failure(new RuntimeException("transaction failed"))
+    case _ => //sender ! akka.actor.Status.Failure(new RuntimeException("transaction failed"))
   }
 }
 
@@ -134,17 +138,21 @@ object MyBankExample extends App {
   val myBankAccount = actorSys.actorOf(BankAccountActor.props("Greg"), "MyBankAccount-Test-01")
   val zabbyAccount = actorSys.actorOf(BankAccountActor.props("Zabby"), "MyBankAccount-Test-02")
 
-  //  myBankActor ! Deposit(200)
-  //  myBankActor ! Deposit(50)
-  //  myBankActor ! Withdraw(120)
+  //  myBankAccount ! Deposit(1000)
+  //  myBankAccount ! Deposit(50)
+  //  myBankAccount ! Withdraw(200)
   //  myBankActor ! Withdraw(10000)
-  //myBankAccount ! Snapshot
-  myBankAccount ! Transfer(100, zabbyAccount.path)
-  //  zabbyAccount! Transfer(50, myBankAccount.path)
+  //  myBankAccount ! Snapshot
+  myBankAccount ! Transaction
+  zabbyAccount ! Transaction
+  Thread.sleep(100)
+  myBankAccount ! TransferCmd(50, zabbyAccount.path)
 
   Thread.sleep(1000)
   myBankAccount ! Query
   zabbyAccount ! Query
+  myBankAccount ! Snapshot
+  zabbyAccount ! Snapshot
 
   Thread.sleep(1000)
   actorSys.terminate()
