@@ -24,6 +24,8 @@ case class DeliveryCmd(deliveryId: Long, money: Int) extends TransactionOp
 
 case class ConfirmedCmd(deliveryId: Long) extends TransactionOp
 
+case object ExitTransaction extends TransactionOp
+
 case class AmountEvt(amount: Int)
 
 sealed abstract class TransactionEvt
@@ -56,6 +58,7 @@ class BankAccountActor(name: String) extends PersistentActor with AtLeastOnceDel
   var myBalance = Balance(accountName)
   var lastSnapshot: SnapshotMetadata = _
 
+  //override def redeliverInterval = 1.second
   //  override def recovery = Recovery(fromSnapshot = SnapshotSelectionCriteria(
   //    maxSequenceNr = 7L,
   //    maxTimestamp =  System.currentTimeMillis()
@@ -66,7 +69,9 @@ class BankAccountActor(name: String) extends PersistentActor with AtLeastOnceDel
       println(s"$accountName balance: " + evt.amount)
       myBalance.update(evt)
     }
-    case evtTranc: TransactionEvt => transfer(evtTranc)
+    case evtTranc: TransactionEvt =>
+      println("Recovery Transaction event:" + evtTranc)
+      transfer(evtTranc)
     case SnapshotOffer(metadata, offeredSnapshot: Balance) => {
       println("Recovery by " + metadata)
       lastSnapshot = metadata
@@ -82,12 +87,9 @@ class BankAccountActor(name: String) extends PersistentActor with AtLeastOnceDel
       deleteSnapshot(lastSnapshot.sequenceNr)
     }
 
-    print("\tSave snapshot...")
     super.saveSnapshot(snapshot)
-    println("Done")
-
-    println("\tDelete messages to Last seqNr " + lastSequenceNr)
     deleteMessages(lastSequenceNr)
+    //    println("\tDelete messages to Last seqNr " + lastSequenceNr)
   }
 
   def transfer(evt: TransactionEvt): Unit = evt match {
@@ -101,57 +103,70 @@ class BankAccountActor(name: String) extends PersistentActor with AtLeastOnceDel
 
   def doTransaction: Receive = {
     case TransferCmd(money, destination) if checkDeposits(money) => {
-      println(s"Transfer money...($accountName)")
+      println(s"**Transfer $money from $accountName")
       persist(AmountEvt(-money))(myBalance.update)
       persist(MoneySentEvt(money, destination))(transfer)
     }
     case ConfirmedCmd(deliveryId) => {
-      println(s"Confirmed...($accountName)")
+      println(s"**Confirmed to $accountName")
       persist(MoneyConfrimedEvt(deliveryId))(transfer)
       unstashAll()
       unbecome()
     }
-    case DeliveryCmd(deliveryId, money) if money > 0 => {
-      println(s"Receive money...($accountName)")
-      persist(AmountEvt(money))(myBalance.update)
-      sender() ! ConfirmedCmd(deliveryId)
+    case ExitTransaction =>
       unstashAll()
       unbecome()
-    }
     case _ => stash()
   }
 
   override def receiveCommand: Receive = {
-    case Withdraw(money) if checkDeposits(money) => persist(AmountEvt(-money))(myBalance.update)
-    case Deposit(money) if money > 0 => persist(AmountEvt(money))(myBalance.update)
+    case Withdraw(money) if checkDeposits(money) =>
+      println(s"$accountName withdraw $money")
+      persist(AmountEvt(-money))(myBalance.update)
+    case Deposit(money) if money > 0 =>
+      println(s"$accountName deposit $money")
+      persist(AmountEvt(money))(myBalance.update)
     case Transaction => become(doTransaction)
     case Query => println(myBalance.toString)
     case Snapshot => saveSnapshot(myBalance)
     case SaveSnapshotSuccess(metadata) => println("Save snapshot successfully in " + metadata)
     case SaveSnapshotFailure(metadata, reason) => println(reason)
+    case DeliveryCmd(deliveryId, money) => {
+      println(s"**Receive $money by $accountName")
+      persist(AmountEvt(money))(myBalance.update)
+      Thread.sleep(2000)
+      sender() ! ConfirmedCmd(deliveryId)
+    }
     case _ => //sender ! akka.actor.Status.Failure(new RuntimeException("transaction failed"))
   }
 }
 
 object MyBankExample extends App {
   val actorSys = ActorSystem("bank")
-  val myBankAccount = actorSys.actorOf(BankAccountActor.props("Greg"), "MyBankAccount-Test-01")
+  val gregAccount = actorSys.actorOf(BankAccountActor.props("Greg"), "MyBankAccount-Test-01")
   val zabbyAccount = actorSys.actorOf(BankAccountActor.props("Zabby"), "MyBankAccount-Test-02")
 
-  //  myBankAccount ! Deposit(1000)
+  gregAccount ! Deposit(1000)
+  zabbyAccount ! Deposit(500)
+  //  myBankActor ! Withdraw(10000)
   //  myBankAccount ! Deposit(50)
   //  myBankAccount ! Withdraw(200)
-  //  myBankActor ! Withdraw(10000)
   //  myBankAccount ! Snapshot
-  myBankAccount ! Transaction
-  zabbyAccount ! Transaction
-  Thread.sleep(100)
-  myBankAccount ! TransferCmd(50, zabbyAccount.path)
+
 
   Thread.sleep(1000)
-  myBankAccount ! Query
+  println("------")
+  gregAccount ! Transaction
+  gregAccount ! Deposit(500)
+  gregAccount ! TransferCmd(250, zabbyAccount.path)
+  Thread.sleep(8000)
+
+  //myBankAccount ! ExitTransaction
+  gregAccount ! Query
   zabbyAccount ! Query
-  myBankAccount ! Snapshot
+
+  println("------")
+  gregAccount ! Snapshot
   zabbyAccount ! Snapshot
 
   Thread.sleep(1000)
